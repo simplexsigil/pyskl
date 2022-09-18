@@ -1,11 +1,97 @@
 import io
+import os.path
+
 import cv2
-import decord
 import matplotlib.pyplot as plt
 import moviepy.editor as mpy
 import numpy as np
 from mmcv import load
 from tqdm import tqdm
+from scipy.stats import mode as get_mode
+
+class DecompressPose:
+    """Load Compressed Pose
+
+    In compressed pose annotations, each item contains the following keys:
+    Original keys: 'label', 'frame_dir', 'img_shape', 'original_shape', 'total_frames'
+    New keys: 'frame_inds', 'keypoint', 'anno_inds'.
+    This operation: 'frame_inds', 'keypoint', 'total_frames', 'anno_inds'
+         -> 'keypoint', 'keypoint_score', 'total_frames'
+
+    Args:
+        squeeze (bool): Whether to remove frames with no human pose. Default: True.
+        max_person (int): The max number of persons in a frame, we keep skeletons with scores from high to low.
+            Default: 10.
+    """
+
+    def __init__(self,
+                 squeeze=True,
+                 max_person=10):
+
+        self.squeeze = squeeze
+        self.max_person = max_person
+
+    def __call__(self, results):
+
+        required_keys = ['total_frames', 'frame_inds', 'keypoint']
+        for k in required_keys:
+            assert k in results
+
+        total_frames = results['total_frames']
+        frame_inds = results.pop('frame_inds')
+        keypoint = results['keypoint']
+
+        if 'anno_inds' in results:
+            frame_inds = frame_inds[results['anno_inds']]
+            keypoint = keypoint[results['anno_inds']]
+
+        assert np.all(np.diff(frame_inds) >= 0), 'frame_inds should be monotonical increasing'
+
+        def mapinds(inds):
+            uni = np.unique(inds)
+            map_ = {x: i for i, x in enumerate(uni)}
+            inds = [map_[x] for x in inds]
+            return np.array(inds, dtype=np.int16)
+
+        if self.squeeze:
+            frame_inds = mapinds(frame_inds)
+            total_frames = np.max(frame_inds) + 1
+
+        results['total_frames'] = total_frames
+
+        num_joints = keypoint.shape[1]
+        num_person = get_mode(frame_inds)[-1][0]
+
+        new_kp = np.zeros([num_person, total_frames, num_joints, 2], dtype=np.float16)
+        new_kpscore = np.zeros([num_person, total_frames, num_joints], dtype=np.float16)
+        # 32768 is enough
+        nperson_per_frame = np.zeros([total_frames], dtype=np.int16)
+
+        for frame_ind, kp in zip(frame_inds, keypoint):
+            person_ind = nperson_per_frame[frame_ind]
+            new_kp[person_ind, frame_ind] = kp[:, :2]
+            new_kpscore[person_ind, frame_ind] = kp[:, 2]
+            nperson_per_frame[frame_ind] += 1
+
+        if num_person > self.max_person:
+            for i in range(total_frames):
+                nperson = nperson_per_frame[i]
+                val = new_kpscore[:nperson, i]
+                score_sum = val.sum(-1)
+
+                inds = sorted(range(nperson), key=lambda x: -score_sum[x])
+                new_kpscore[:nperson, i] = new_kpscore[inds, i]
+                new_kp[:nperson, i] = new_kp[inds, i]
+            num_person = self.max_person
+            results['num_person'] = num_person
+
+        results['keypoint'] = new_kp[:num_person]
+        results['keypoint_score'] = new_kpscore[:num_person]
+        return results
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(squeeze={self.squeeze}, max_person={self.max_person})')
+
 
 class Vis3DPose:
 
@@ -83,30 +169,73 @@ class Vis3DPose:
         return mpy.ImageSequenceClip(self.images, fps=self.fps)
 
 
-def Vis2DPose(item, thre=0.2, out_shape=(540, 960), layout='coco', fps=24, video=None):
+def Vis2DPose(item, thre=0.2, out_shape=(540, 960), layout='coco', fps=30, video=None, annotations_root=None,
+              pose_decompressor: DecompressPose = DecompressPose(squeeze=False)):
     if isinstance(item, str):
         item = load(item)
 
     assert layout == 'coco'
 
+    if "keypoint" not in item:  # Kinetics:
+        print("Loading keypoint subset...")
+        sample_keypoints_subset = load(os.path.join(annotations_root, "kpfiles", os.path.split(item["raw_file"])[1]))
+        print("Finished.")
+        kp = sample_keypoints_subset[item["frame_dir"]]["keypoint"]
+        item['keypoint'] = kp
+        item['frame_inds'] -= 1
+
+        item = pose_decompressor(item)
+
     kp = item['keypoint']
+    kp_frames = kp.shape[1]
+
+    # Cat-ing score
     if 'keypoint_score' in item:
         kpscore = item['keypoint_score']
         kp = np.concatenate([kp, kpscore[..., None]], -1)
 
     assert kp.shape[-1] == 3
+
+    # Keypoint output scaling
     img_shape = item.get('img_shape', out_shape)
     kp[..., 0] *= out_shape[1] / img_shape[1]
     kp[..., 1] *= out_shape[0] / img_shape[0]
 
-    total_frames = item.get('total_frames', kp.shape[1])
-    assert total_frames == kp.shape[1]
+    total_frames = item.get('total_frames', kp_frames)
+    assert total_frames == kp_frames
 
     if video is None:
         frames = [np.ones([out_shape[0], out_shape[1], 3], dtype=np.uint8) * 255 for i in range(total_frames)]
     else:
-        vid = decord.VideoReader(video)
-        frames = [x.asnumpy() for x in vid]
+        frames = []
+
+        cap = cv2.VideoCapture(video)
+        fpsc = cap.get(cv2.CAP_PROP_FPS)
+        if not fpsc:
+            print(f"Could not read fps from file, assuming {fps}")
+        else:
+            fps = fpsc
+
+        # Check if camera opened successfully
+        if (cap.isOpened() == False):
+            print("Error opening video stream or file")
+
+        # Read until video is completed
+        while (cap.isOpened()):
+            # Capture frame-by-frame
+            ret, frame = cap.read()
+            if ret == True:
+                # Display the resulting frame
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+            # Break the loop
+            else:
+                break
+
+        # When everything done, release the video capture object
+        cap.release()
+
+        # frames = [x.asnumpy() for x in vid]
         frames = [cv2.resize(x, (out_shape[1], out_shape[0])) for x in frames]
         if len(frames) != total_frames:
             frames = [frames[int(i / total_frames * len(frames))] for i in range(total_frames)]
@@ -138,4 +267,4 @@ def Vis2DPose(item, thre=0.2, out_shape=(540, 960), layout='coco', fps=24, video
                     color = [x + (y - x) * (conf - thre) / 0.8 for x, y in zip(co_tup[0], co_tup[1])]
                     color = tuple([int(x) for x in color])
                     frames[i] = cv2.line(frames[i], (j1x, j1y), (j2x, j2y), color, thickness=2)
-    return mpy.ImageSequenceClip(frames, fps=fps)
+    return frames, fps
